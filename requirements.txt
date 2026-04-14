@@ -1,0 +1,27 @@
+# Core crypto
+cryptography>=43.0.0
+
+# Post-quantum KEM (ML-KEM-768)
+# NOTE: Requires native liboqs C library built and installed first:
+#   git clone https://github.com/open-quantum-safe/liboqs && cd liboqs
+#   cmake -DBUILD_SHARED_LIBS=ON . && make -j$(nproc) && sudo make install && sudo ldconfig
+# Then: pip install liboqs-python
+liboqs-python>=0.11.0
+
+# Argon2id for passphrase-based key derivation
+argon2-cffi>=23.1.0
+
+# Networking / API
+aiohttp>=3.10.0
+fastapi>=0.115.0
+uvicorn>=0.32.0
+zeroconf>=0.136.0
+websockets>=13.0
+
+# CLI
+typer>=0.12.0
+rich>=13.0.0
+
+# Dev / testing
+pytest>=9.0.0
+pytest-asyncio>=0.23.0

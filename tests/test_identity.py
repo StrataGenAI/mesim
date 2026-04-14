@@ -408,3 +408,98 @@ def test_device_identity_is_mutable():
     ident = create_identity("TANGO-18", Rank.SQUAD)
     ident.rank = Rank.NCO
     assert ident.rank == Rank.NCO
+
+
+# ---------------------------------------------------------------------------
+# Duress PIN
+# ---------------------------------------------------------------------------
+
+
+@requires_liboqs
+def test_real_passphrase_still_loads_real_identity_with_duress_configured(tmp_path):
+    """Real passphrase returns real identity even when duress PIN is set."""
+    ident = create_identity("UNIFORM-19", Rank.COMMAND)
+    path = tmp_path / "uniform.json"
+    save_identity(ident, path, "real_pass", duress_passphrase="duress_pass")
+    loaded = load_identity(path, "real_pass")
+    assert loaded.device_id == ident.device_id
+    assert loaded.callsign == ident.callsign
+
+
+@requires_liboqs
+def test_duress_passphrase_returns_decoy_identity(tmp_path):
+    """Duress passphrase returns a decoy with same callsign/rank but different device_id."""
+    ident = create_identity("VICTOR-20", Rank.NCO)
+    path = tmp_path / "victor.json"
+    save_identity(ident, path, "real_pass", duress_passphrase="duress_pass")
+    decoy = load_identity(path, "duress_pass")
+    assert decoy.callsign == ident.callsign
+    assert decoy.rank == ident.rank
+    assert decoy.device_id != ident.device_id
+
+
+@requires_liboqs
+def test_duress_wipes_real_keys_from_disk(tmp_path):
+    """After duress activation, real passphrase no longer decrypts the file."""
+    ident = create_identity("WHISKEY-21", Rank.OFFICER)
+    path = tmp_path / "whiskey.json"
+    save_identity(ident, path, "real_pass", duress_passphrase="duress_pass")
+    load_identity(path, "duress_pass")  # activates duress → wipe
+    with pytest.raises(InvalidTag):
+        load_identity(path, "real_pass")
+
+
+@requires_liboqs
+def test_duress_file_has_no_duress_section_after_wipe(tmp_path):
+    """The identity file after duress activation looks like a normal file (no duress fields)."""
+    ident = create_identity("XRAY-22", Rank.SQUAD)
+    path = tmp_path / "xray.json"
+    save_identity(ident, path, "real_pass", duress_passphrase="duress_pass")
+    load_identity(path, "duress_pass")  # activate duress
+    doc = json.loads(path.read_text())
+    assert "duress_encrypted_keys" not in doc
+    assert "duress_salt" not in doc
+
+
+@requires_liboqs
+def test_decoy_loadable_after_wipe_with_duress_passphrase(tmp_path):
+    """After wipe, duress passphrase loads the same decoy identity consistently."""
+    ident = create_identity("YANKEE-23", Rank.SQUAD)
+    path = tmp_path / "yankee.json"
+    save_identity(ident, path, "real_pass", duress_passphrase="duress_pass")
+    decoy1 = load_identity(path, "duress_pass")   # first load — activates wipe
+    decoy2 = load_identity(path, "duress_pass")   # second load — from wiped file
+    assert decoy1.device_id == decoy2.device_id
+
+
+@requires_liboqs
+def test_wrong_passphrase_raises_invalid_tag_with_duress_configured(tmp_path):
+    """Wrong passphrase raises InvalidTag even when duress is configured."""
+    ident = create_identity("ZULU-24", Rank.NCO)
+    path = tmp_path / "zulu.json"
+    save_identity(ident, path, "real_pass", duress_passphrase="duress_pass")
+    with pytest.raises(InvalidTag):
+        load_identity(path, "totally_wrong")
+
+
+@requires_liboqs
+def test_save_without_duress_has_no_duress_fields(tmp_path):
+    """Identity file saved without duress_passphrase contains no duress fields."""
+    ident = create_identity("ALPHA-99", Rank.SQUAD)
+    path = tmp_path / "a99.json"
+    save_identity(ident, path, "pass")
+    doc = json.loads(path.read_text())
+    assert "duress_encrypted_keys" not in doc
+    assert "duress_salt" not in doc
+    assert "duress_device_id" not in doc
+
+
+@requires_liboqs
+def test_decoy_identity_has_valid_keypairs(tmp_path):
+    """Decoy identity returned by duress path has working keypairs (verifiable bundle)."""
+    ident = create_identity("BRAVO-99", Rank.COMMAND)
+    path = tmp_path / "b99.json"
+    save_identity(ident, path, "real_pass", duress_passphrase="duress_pass")
+    decoy = load_identity(path, "duress_pass")
+    bundle = get_public_bundle(decoy)
+    verify_public_bundle(bundle)  # must not raise

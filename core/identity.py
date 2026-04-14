@@ -390,6 +390,8 @@ def save_identity(
     identity: DeviceIdentity,
     path: str | os.PathLike,
     passphrase: str | bytes,
+    *,
+    duress_passphrase: str | bytes | None = None,
 ) -> None:
     """
     Encrypt and persist a device identity to disk.
@@ -398,9 +400,13 @@ def save_identity(
     from the passphrase via Argon2id (or Scrypt fallback).
 
     Args:
-        identity:   The DeviceIdentity to save.
-        path:       Destination file path (.json recommended).
-        passphrase: Encryption passphrase (str or bytes).
+        identity:          The DeviceIdentity to save.
+        path:              Destination file path (.json recommended).
+        passphrase:        Encryption passphrase (str or bytes).
+        duress_passphrase: Optional secondary passphrase.  When load_identity()
+                           is called with this passphrase it returns a blank
+                           decoy identity (same callsign/rank, fresh keypairs)
+                           and wipes the real keys from disk.
 
     Raises:
         OSError: on write failure.
@@ -430,6 +436,25 @@ def save_identity(
         },
         "encrypted_private_keys": base64.b64encode(encrypted_private).decode(),
     }
+
+    if duress_passphrase is not None:
+        duress_b = _normalize_passphrase(duress_passphrase)
+        # Generate a fresh decoy — same callsign/rank, new device_id + keypairs.
+        decoy = create_identity(identity.callsign, identity.rank)
+        d_salt  = os.urandom(32)
+        d_nonce = os.urandom(12)
+        d_wrap  = _derive_wrap_key(duress_b, d_salt)
+        d_blob  = _serialize_private_keys(decoy)
+        d_ct    = ChaCha20Poly1305(d_wrap).encrypt(d_nonce, d_blob, None)
+        doc["duress_salt"]           = base64.b64encode(d_salt).decode()
+        doc["duress_nonce"]          = base64.b64encode(d_nonce).decode()
+        doc["duress_encrypted_keys"] = base64.b64encode(d_ct).decode()
+        doc["duress_device_id"]      = decoy.device_id
+        doc["duress_public_keys"]    = {
+            "verify_key":  base64.b64encode(decoy.signing_keypair.verify_key.raw).decode(),
+            "encrypt_pub": base64.b64encode(decoy.encrypt_keypair.public_key.raw).decode(),
+            "kem_pub":     base64.b64encode(decoy.kem_keypair.public_key.raw).decode(),
+        }
 
     Path(path).write_text(json.dumps(doc, indent=2), encoding="utf-8")
 
@@ -466,8 +491,41 @@ def load_identity(
     wrap_key = _derive_wrap_key_from_params(passphrase_b, salt, doc["kdf"], doc["kdf_params"])
     chacha = ChaCha20Poly1305(wrap_key)
 
-    # InvalidTag propagates directly — same error for wrong passphrase or corruption
-    private_blob = chacha.decrypt(nonce, encrypted_private, None)
+    # Try real passphrase first.
+    # InvalidTag on wrong passphrase is caught below to attempt duress path.
+    try:
+        private_blob = chacha.decrypt(nonce, encrypted_private, None)
+    except InvalidTag:
+        # Check if duress is configured in this identity file.
+        if "duress_encrypted_keys" not in doc:
+            raise  # No duress configured — propagate original InvalidTag.
+
+        # Attempt decryption with the supplied passphrase as the duress key.
+        d_salt  = base64.b64decode(doc["duress_salt"])
+        d_nonce = base64.b64decode(doc["duress_nonce"])
+        d_ct    = base64.b64decode(doc["duress_encrypted_keys"])
+        d_wrap  = _derive_wrap_key_from_params(passphrase_b, d_salt, doc["kdf"], doc["kdf_params"])
+        try:
+            decoy_blob = ChaCha20Poly1305(d_wrap).decrypt(d_nonce, d_ct, None)
+        except InvalidTag:
+            raise InvalidTag() from None  # Neither real nor duress passphrase matched.
+
+        # Duress passphrase accepted — reconstruct decoy identity.
+        d_ed_kp, d_x_kp, d_kem_kp = _deserialize_private_keys(decoy_blob)
+        decoy = DeviceIdentity(
+            device_id=doc["duress_device_id"],
+            callsign=doc["callsign"],
+            rank=Rank(doc["rank"]),
+            signing_keypair=d_ed_kp,
+            encrypt_keypair=d_x_kp,
+            kem_keypair=d_kem_kp,
+        )
+
+        # Wipe — overwrite the identity file with a clean single-identity file
+        # encrypted with the duress passphrase.  Real keys are gone from disk.
+        save_identity(decoy, path, passphrase)
+
+        return decoy
 
     ed_kp, x_kp, kem_kp = _deserialize_private_keys(private_blob)
 

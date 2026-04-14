@@ -6,19 +6,26 @@ Intended to run on each field device; never exposed to the internet.
 
 Endpoints:
   GET  /health             — liveness + identity info
+  GET  /bundle             — our PublicBundle (base64) for peer handshake initiation
   GET  /peers              — active encrypted sessions
   GET  /routes             — BATMAN route table
   POST /send               — send or queue a message
   GET  /messages/{peer_id} — paginated message history
+
+Security:
+  - Rate limiting: max requests_per_minute (default 100) per client IP
+  - Message size cap: MAX_MESSAGE_BYTES (4096) per /send payload
 """
 
 from __future__ import annotations
 
 import base64
+import collections
 import time
 from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from core.identity import get_public_bundle
@@ -29,6 +36,13 @@ if TYPE_CHECKING:
     from mesh.router import MeshRouter
     from mesh.store_forward import StoreForward
     from mesh.transport import MeshTransport
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+MAX_MESSAGE_BYTES = 4096  # maximum encoded payload per /send request
 
 
 # ---------------------------------------------------------------------------
@@ -58,12 +72,17 @@ def create_app(
     router: "MeshRouter",
     store_forward: "StoreForward",
     message_store: "MessageStore",
+    requests_per_minute: int = 100,
 ) -> FastAPI:
     """
     Build and return the FastAPI application.
 
     All subsystems are injected via app.state so endpoints remain fully
     testable without module-level singletons.
+
+    Args:
+        requests_per_minute: sliding-window rate limit per client IP.
+                             Set to 0 to disable rate limiting.
     """
     app = FastAPI(
         title="MESIM Device API",
@@ -78,6 +97,27 @@ def create_app(
     app.state.router = router
     app.state.store_forward = store_forward
     app.state.message_store = message_store
+    app.state.rate_buckets: dict[str, collections.deque] = {}
+
+    # ── Rate-limiting middleware ────────────────────────────────────────────
+
+    if requests_per_minute > 0:
+        @app.middleware("http")
+        async def _rate_limit(request: Request, call_next):
+            client_ip = request.client.host if request.client else "unknown"
+            now = time.time()
+            buckets = request.app.state.rate_buckets
+            bucket = buckets.setdefault(client_ip, collections.deque())
+            # evict timestamps older than 60 s
+            while bucket and bucket[0] < now - 60:
+                bucket.popleft()
+            if len(bucket) >= requests_per_minute:
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "rate limit exceeded"},
+                )
+            bucket.append(now)
+            return await call_next(request)
 
     # ── /health ────────────────────────────────────────────────────────────
 
@@ -182,11 +222,17 @@ def create_app(
         The message is also saved to the local MessageStore in both cases so
         GET /messages/{peer_id} returns sent history.
 
+        Returns 413 if the message exceeds MAX_MESSAGE_BYTES.
         Returns 503 if the underlying transport raises (e.g. queue full).
         """
+        payload = body.message.encode("utf-8")
+        if len(payload) > MAX_MESSAGE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"message too large: {len(payload)} bytes (max {MAX_MESSAGE_BYTES})",
+            )
         sf = request.app.state.store_forward
         ms = request.app.state.message_store
-        payload = body.message.encode("utf-8")
         try:
             delivered = await sf.send_or_queue(body.peer_id, payload)
         except Exception as exc:

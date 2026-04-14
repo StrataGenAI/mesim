@@ -110,6 +110,7 @@ def _build_client(
     send_or_queue_raises: Exception | None = None,
     save_message_result: int = 1,
     history: list | None = None,
+    requests_per_minute: int = 100,
 ) -> TestClient:
     """Build a TestClient with fully mocked subsystems."""
     ident = identity or _make_identity()
@@ -133,7 +134,8 @@ def _build_client(
     ms.save_message.return_value = save_message_result
     ms.get_history.return_value = history
 
-    app = create_app(ident, transport, router, sf, ms)
+    app = create_app(ident, transport, router, sf, ms,
+                     requests_per_minute=requests_per_minute)
     return TestClient(app)
 
 
@@ -472,3 +474,110 @@ class TestMessages:
         resp = client.get("/messages/any")
         ids = [m["id"] for m in resp.json()]
         assert ids == [1, 2, 3]
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+
+class TestRateLimit:
+    def test_allows_requests_under_limit(self) -> None:
+        client = _build_client(requests_per_minute=5)
+        for _ in range(5):
+            resp = client.get("/health")
+            assert resp.status_code == 200
+
+    def test_blocks_at_rate_limit(self) -> None:
+        client = _build_client(requests_per_minute=5)
+        for _ in range(5):
+            client.get("/health")
+        resp = client.get("/health")
+        assert resp.status_code == 429
+
+    def test_rate_limit_detail_message(self) -> None:
+        client = _build_client(requests_per_minute=1)
+        client.get("/health")
+        resp = client.get("/health")
+        assert resp.json()["detail"] == "rate limit exceeded"
+
+    def test_rate_limit_zero_disables_limiting(self) -> None:
+        # requests_per_minute=0 disables rate limiting entirely
+        client = _build_client(requests_per_minute=0)
+        for _ in range(200):
+            resp = client.get("/health")
+            assert resp.status_code == 200
+
+    def test_rate_limit_resets_after_window(self) -> None:
+        """Each TestClient has its own fresh bucket — new client is fresh."""
+        client1 = _build_client(requests_per_minute=2)
+        client1.get("/health")
+        client1.get("/health")
+        assert client1.get("/health").status_code == 429
+
+        # Brand-new client = brand-new app = empty bucket
+        client2 = _build_client(requests_per_minute=2)
+        assert client2.get("/health").status_code == 200
+
+    def test_rate_limit_applies_to_all_endpoints(self) -> None:
+        client = _build_client(requests_per_minute=2)
+        client.get("/health")
+        client.get("/peers")
+        resp = client.get("/routes")
+        assert resp.status_code == 429
+
+
+# ---------------------------------------------------------------------------
+# Message size cap
+# ---------------------------------------------------------------------------
+
+
+class TestMessageSizeCap:
+    def test_message_within_limit_accepted(self) -> None:
+        client = _build_client()
+        resp = client.post(
+            "/send",
+            json={"peer_id": "ff00" * 8, "message": "x" * 100},
+        )
+        assert resp.status_code == 200
+
+    def test_message_at_limit_accepted(self) -> None:
+        # 4096 ASCII chars = 4096 bytes
+        client = _build_client()
+        resp = client.post(
+            "/send",
+            json={"peer_id": "ff00" * 8, "message": "x" * 4096},
+        )
+        assert resp.status_code == 200
+
+    def test_message_over_limit_returns_413(self) -> None:
+        client = _build_client()
+        resp = client.post(
+            "/send",
+            json={"peer_id": "ff00" * 8, "message": "x" * 4097},
+        )
+        assert resp.status_code == 413
+
+    def test_413_detail_mentions_too_large(self) -> None:
+        client = _build_client()
+        resp = client.post(
+            "/send",
+            json={"peer_id": "ff00" * 8, "message": "x" * 5000},
+        )
+        assert "too large" in resp.json()["detail"]
+
+    def test_413_detail_mentions_byte_count(self) -> None:
+        client = _build_client()
+        resp = client.post(
+            "/send",
+            json={"peer_id": "ff00" * 8, "message": "x" * 5000},
+        )
+        assert "5000" in resp.json()["detail"]
+
+    def test_empty_message_accepted(self) -> None:
+        client = _build_client()
+        resp = client.post(
+            "/send",
+            json={"peer_id": "ff00" * 8, "message": ""},
+        )
+        assert resp.status_code == 200

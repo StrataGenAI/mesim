@@ -64,6 +64,12 @@ After EVERY phase completion, before saying "done":
 - Phase 3: DONE (350 tests passing)
   - DONE: api/server.py (39 tests — FastAPI create_app() factory, /health /peers /routes /send /messages)
   - DONE: cli/mesim_cli.py (70 tests — argparse, rich Console, MesimCLI async REPL, load_or_create_identity)
+- Phase 4: DONE (398 tests passing)
+  - DONE: mesh/store_forward.py — peer_id normalization (32-char no-hyphen → UUID4), periodic 30s flush loop, console output
+  - DONE: api/server.py — rate limiting (100 req/min sliding window per IP, HTTP 429), message size cap (4096 bytes, HTTP 413)
+  - DONE: core/identity.py — duress PIN (save_identity duress_passphrase kwarg; load with duress → decoy identity + wipe real keys)
+  - DONE: cli/mesim_cli.py — --lock-timeout N (dead man's switch; HMAC-verified passphrase re-entry after N min inactivity)
+  - DONE: tests/test_integration.py (3 tests — full E2E two-node: handshake+5 live, queue+reconnect, 5+3=8 across offline/reconnect)
 
 ## Known Issues / Gotchas
 - Firewall: the following ports must be open between nodes for full operation:
@@ -71,6 +77,32 @@ After EVERY phase completion, before saying "done":
   - TCP API ports (e.g. 8001, 8002) — bundle fetch (`GET /bundle`) before handshake
   - In production: API ports should be firewalled to LAN/VLAN only, never internet-exposed
   - The API server binds to `0.0.0.0` so peers can reach it at the node's real IP; restrict via iptables/nftables in hardened deployments
+
+## Threat Model
+- **Passive observer**: sign-then-encrypt hides sender identity; PQC (ML-KEM-768) defeats harvest-now/decrypt-later
+- **Active MITM**: PublicBundle signed over all fields (Ed25519); verified before any KEM exchange; bundle_sig covers device_id
+- **Captured device**: Argon2id KDF (64 MiB, t=3) slows brute force; duress PIN wipes real keys and returns decoy identity
+- **Physical coercion**: duress passphrase → decoy identity (same callsign/rank, different device_id/keys); real keys erased from disk on first duress load
+- **API abuse**: rate limit (100 req/min per IP), message size cap (4096 bytes), API binds 0.0.0.0 but must be restricted via iptables in production
+- **Replay/DoS**: originator seq_num loop prevention; MAX_REASSEMBLY_BUFS=64; MAX_QUEUE_PER_PEER=256 in store-forward
+- **Oracle**: wrong passphrase and corrupted file both raise InvalidTag (indistinguishable); HMAC-SHA256 sentinel in MessageStore
+
+## Deployment Guide
+```
+# Create identity
+python -m cli.mesim_cli --create ALPHA-1 --rank NCO --identity alpha.json
+
+# Run node (passphrase prompted)
+python -m cli.mesim_cli --identity alpha.json --port 9001 --api-port 8001
+
+# Run node with dead man's switch (lock after 10 min inactivity)
+python -m cli.mesim_cli --identity alpha.json --lock-timeout 10
+
+# Firewall rules (iptables example)
+iptables -A INPUT -p udp --dport 9001 -j ACCEPT   # mesh transport
+iptables -A INPUT -p tcp --dport 8001 -s 10.0.0.0/24 -j ACCEPT  # API (LAN only)
+iptables -A INPUT -p tcp --dport 8001 -j DROP
+```
 
 ## Decisions Log
 - 2026-04-11: CLAUDE.md created on project init per Stratagen Master System Prompt v2.6
@@ -85,3 +117,8 @@ After EVERY phase completion, before saying "done":
 - 2026-04-12: api/server.py uses create_app() factory (not module-level singletons) so all subsystems are injected via app.state — enables full TestClient-based testing without networking
 - 2026-04-12: cli/mesim_cli.py accepts an optional rich.Console in MesimCLI.__init__() for test output capture; Console(file=StringIO()) in tests avoids capsys conflicts with rich markup
 - 2026-04-12: binary bytes(range(N)) passes UTF-8 decode for N≤127; always use b"\xff\xfe..." for guaranteed-invalid UTF-8 test payloads
+- 2026-04-14: mesh/store_forward.py normalize_peer_id() converts 32-char no-hyphen wire format to UUID4; applied at all DB access points so messages queued with old format are always findable
+- 2026-04-14: StoreForward periodic flush loop uses module-level _FLUSH_INTERVAL=30; monkeypatched to 0.05 in tests for speed
+- 2026-04-14: api/server.py rate limit stored in app.state.rate_buckets dict (client_ip→deque); each create_app() call gets fresh state so test isolation is free
+- 2026-04-14: identity.py duress PIN stores decoy keys under separate duress_salt/duress_nonce/duress_encrypted_keys; on duress activation, save_identity(decoy, path, duress_passphrase) overwrites file — duress fields absent in wiped file
+- 2026-04-14: CLI lock uses HMAC-SHA256(key=b"mesim-lock-v1", msg=passphrase) not plaintext; hmac.compare_digest() prevents timing attacks on passphrase comparison

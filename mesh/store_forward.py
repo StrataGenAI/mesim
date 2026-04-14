@@ -347,8 +347,14 @@ class StoreForward:
         peer_id = normalize_peer_id(peer_id)
         pending = self._queue.get_pending(peer_id)
         if pending and self._console is not None:
+            sessions = self._transport.get_sessions()
+            callsign = (
+                sessions[peer_id].peer_bundle.callsign
+                if peer_id in sessions
+                else peer_id
+            )
             self._console.print(
-                f"[store-forward] flushing {len(pending)} message(s) to {peer_id}",
+                f"[DTN] flushing {len(pending)} messages to {callsign}",
                 markup=False,
             )
         sent = 0

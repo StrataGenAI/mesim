@@ -525,14 +525,16 @@ async def test_flush_peer_normalizes_32char_peer_id(tmp_db, store_key):
 
 
 async def test_flush_peer_prints_console_output(tmp_db, store_key):
-    """flush_peer prints '[store-forward] flushing N message(s) to PEER' when pending."""
+    """flush_peer prints '[DTN] flushing N messages to CALLSIGN' when pending."""
     from io import StringIO
     from rich.console import Console
 
     out = StringIO()
     console = Console(file=out, highlight=False)
 
-    transport = _make_transport(sessions={"peer1": MagicMock()})
+    session_mock = MagicMock()
+    session_mock.peer_bundle.callsign = "BRAVO-1"
+    transport = _make_transport(sessions={"peer1": session_mock})
     q = ForwardQueue(tmp_db, store_key)
     q.open()
     q.enqueue("peer1", b"msg1")
@@ -545,7 +547,7 @@ async def test_flush_peer_prints_console_output(tmp_db, store_key):
     q.close()
 
     output = out.getvalue()
-    assert "[store-forward] flushing 2 message(s) to peer1" in output
+    assert "[DTN] flushing 2 messages to BRAVO-1" in output
 
 
 async def test_flush_peer_no_output_when_queue_empty(tmp_db, store_key):

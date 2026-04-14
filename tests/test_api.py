@@ -336,10 +336,12 @@ class TestSend:
         assert resp.json()["queued"] is True
 
     def test_returns_peer_id(self) -> None:
+        # 32-char hex input is normalized to UUID4 in the response
         pid = "ff00" * 8
+        normalized = "ff00ff00-ff00-ff00-ff00-ff00ff00ff00"
         client = _build_client()
         resp = client.post("/send", json={"peer_id": pid, "message": "x"})
-        assert resp.json()["peer_id"] == pid
+        assert resp.json()["peer_id"] == normalized
 
     def test_transport_error_returns_503(self) -> None:
         client = _build_client(send_or_queue_raises=RuntimeError("queue full"))
@@ -378,7 +380,7 @@ class TestSend:
         app = create_app(_make_identity(), transport, MagicMock(), sf, ms)
         client = TestClient(app)
         client.post("/send", json={"peer_id": "ff00" * 8, "message": "stored"})
-        ms.save_message.assert_called_once_with("ff00" * 8, "sent", b"stored")
+        ms.save_message.assert_called_once_with("ff00ff00-ff00-ff00-ff00-ff00ff00ff00", "sent", b"stored")
 
 
 # ---------------------------------------------------------------------------

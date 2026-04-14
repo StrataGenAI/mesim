@@ -29,6 +29,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from core.identity import get_public_bundle
+from mesh.store_forward import normalize_peer_id
 
 if TYPE_CHECKING:
     from core.identity import DeviceIdentity
@@ -231,14 +232,15 @@ def create_app(
                 status_code=413,
                 detail=f"message too large: {len(payload)} bytes (max {MAX_MESSAGE_BYTES})",
             )
+        peer_id = normalize_peer_id(body.peer_id)
         sf = request.app.state.store_forward
         ms = request.app.state.message_store
         try:
-            delivered = await sf.send_or_queue(body.peer_id, payload)
+            delivered = await sf.send_or_queue(peer_id, payload)
         except Exception as exc:
             raise HTTPException(status_code=503, detail=str(exc))
-        msg_id = ms.save_message(body.peer_id, "sent", payload)
-        return SendResponse(peer_id=body.peer_id, queued=not delivered, msg_id=msg_id)
+        msg_id = ms.save_message(peer_id, "sent", payload)
+        return SendResponse(peer_id=peer_id, queued=not delivered, msg_id=msg_id)
 
     # ── /messages/{peer_id} ────────────────────────────────────────────────
 

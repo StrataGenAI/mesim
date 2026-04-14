@@ -622,3 +622,108 @@ class TestOnMessageReceived:
         await cli._on_message_received(pid, b"hello")
         # Should show first 8 chars of peer_id as callsign fallback
         assert "abcdef01" in buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Dead man's switch — lock timeout
+# ---------------------------------------------------------------------------
+
+
+class TestLockTimeout:
+    def test_lock_timeout_arg_default_none(self) -> None:
+        args = build_arg_parser().parse_args([])
+        assert args.lock_timeout is None
+
+    def test_lock_timeout_arg_parsed(self) -> None:
+        args = build_arg_parser().parse_args(["--lock-timeout", "5"])
+        assert args.lock_timeout == 5
+
+    def test_is_locked_false_when_timeout_none(self) -> None:
+        console, _ = _make_console()
+        ident = _make_identity_mock()
+        transport = MagicMock(); transport.get_sessions.return_value = {}
+        transport.on_message = MagicMock()
+        cli = MesimCLI(ident, transport, MagicMock(), MagicMock(), MagicMock(),
+                       console=console, lock_timeout=None, passphrase="secret")
+        assert cli._is_locked() is False
+
+    def test_is_locked_false_when_no_passphrase(self) -> None:
+        console, _ = _make_console()
+        ident = _make_identity_mock()
+        transport = MagicMock(); transport.get_sessions.return_value = {}
+        transport.on_message = MagicMock()
+        cli = MesimCLI(ident, transport, MagicMock(), MagicMock(), MagicMock(),
+                       console=console, lock_timeout=1, passphrase=None)
+        assert cli._is_locked() is False
+
+    def test_is_locked_false_when_recently_active(self) -> None:
+        console, _ = _make_console()
+        ident = _make_identity_mock()
+        transport = MagicMock(); transport.get_sessions.return_value = {}
+        transport.on_message = MagicMock()
+        cli = MesimCLI(ident, transport, MagicMock(), MagicMock(), MagicMock(),
+                       console=console, lock_timeout=5, passphrase="secret")
+        # _last_activity just set in __init__ — not locked
+        assert cli._is_locked() is False
+
+    def test_is_locked_true_when_timeout_elapsed(self) -> None:
+        console, _ = _make_console()
+        ident = _make_identity_mock()
+        transport = MagicMock(); transport.get_sessions.return_value = {}
+        transport.on_message = MagicMock()
+        cli = MesimCLI(ident, transport, MagicMock(), MagicMock(), MagicMock(),
+                       console=console, lock_timeout=1, passphrase="secret")
+        # Simulate 2 minutes of inactivity
+        cli._last_activity = time.time() - 120
+        assert cli._is_locked() is True
+
+    def test_handle_command_resets_last_activity(self) -> None:
+        import asyncio as _aio
+        cli, _ = _make_cli()
+        cli._last_activity = time.time() - 999
+        before = cli._last_activity
+        _aio.get_event_loop().run_until_complete(cli.handle_command("whoami"))
+        assert cli._last_activity > before
+
+    def test_hash_passphrase_deterministic(self) -> None:
+        h1 = MesimCLI._hash_passphrase("secret")
+        h2 = MesimCLI._hash_passphrase("secret")
+        assert h1 == h2
+
+    def test_hash_passphrase_different_inputs_differ(self) -> None:
+        assert MesimCLI._hash_passphrase("a") != MesimCLI._hash_passphrase("b")
+
+    @pytest.mark.asyncio
+    async def test_prompt_unlock_accepts_correct_passphrase(self) -> None:
+        from unittest.mock import patch
+        console, buf = _make_console()
+        ident = _make_identity_mock()
+        transport = MagicMock(); transport.get_sessions.return_value = {}
+        transport.on_message = MagicMock()
+        cli = MesimCLI(ident, transport, MagicMock(), MagicMock(), MagicMock(),
+                       console=console, lock_timeout=1, passphrase="correct")
+        cli._last_activity = time.time() - 120  # locked
+
+        with patch("getpass.getpass", return_value="correct"):
+            await cli._prompt_unlock()
+
+        assert not cli._is_locked()
+        assert "Unlocked" in buf.getvalue()
+
+    @pytest.mark.asyncio
+    async def test_prompt_unlock_rejects_wrong_then_accepts_correct(self) -> None:
+        from unittest.mock import patch
+        console, buf = _make_console()
+        ident = _make_identity_mock()
+        transport = MagicMock(); transport.get_sessions.return_value = {}
+        transport.on_message = MagicMock()
+        cli = MesimCLI(ident, transport, MagicMock(), MagicMock(), MagicMock(),
+                       console=console, lock_timeout=1, passphrase="correct")
+        cli._last_activity = time.time() - 120
+
+        # wrong once, then correct
+        with patch("getpass.getpass", side_effect=["wrong", "correct"]):
+            await cli._prompt_unlock()
+
+        assert "Incorrect" in buf.getvalue()
+        assert "Unlocked" in buf.getvalue()

@@ -28,6 +28,7 @@ import asyncio
 import base64
 import getpass
 import hashlib
+import hmac
 import io
 import sys
 import time
@@ -103,6 +104,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="RANK",
         default="SQUAD",
         help="Rank for --create: COMMAND, OFFICER, NCO, SQUAD",
+    )
+    parser.add_argument(
+        "--lock-timeout",
+        type=int,
+        default=None,
+        metavar="MIN",
+        help="Minutes of inactivity before requiring passphrase re-entry (disabled by default)",
     )
     return parser
 
@@ -192,6 +200,8 @@ class MesimCLI:
         store_forward: "StoreForward",
         message_store: "MessageStore",
         console: Console | None = None,
+        lock_timeout: int | None = None,
+        passphrase: str | None = None,
     ) -> None:
         self._identity = identity
         self._transport = transport
@@ -200,6 +210,14 @@ class MesimCLI:
         self._store = message_store
         self._console = console or Console()
         self._running = False
+        # Dead man's switch: lock after N minutes of inactivity.
+        self._lock_timeout = lock_timeout          # None = disabled
+        self._last_activity: float = time.time()
+        # HMAC key stored in memory; used to verify re-entered passphrase without
+        # keeping the plaintext passphrase around any longer than necessary.
+        self._passphrase_hmac: bytes | None = (
+            self._hash_passphrase(passphrase) if passphrase is not None else None
+        )
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
@@ -211,6 +229,43 @@ class MesimCLI:
 
     async def stop(self) -> None:
         self._running = False
+
+    # ── Lock helpers ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _hash_passphrase(passphrase: str) -> bytes:
+        """Return HMAC-SHA256 of the passphrase under a fixed key for comparison."""
+        return hmac.new(b"mesim-lock-v1", passphrase.encode("utf-8"), "sha256").digest()
+
+    def _is_locked(self) -> bool:
+        """Return True if the inactivity timeout has elapsed."""
+        if self._lock_timeout is None or self._passphrase_hmac is None:
+            return False
+        elapsed_minutes = (time.time() - self._last_activity) / 60
+        return elapsed_minutes >= self._lock_timeout
+
+    async def _prompt_unlock(self) -> None:
+        """
+        Block the REPL until the correct passphrase is entered.
+
+        Reads from stdin in a thread executor so the event loop stays live
+        (incoming mesh packets continue to be processed while locked).
+        """
+        self._console.print(
+            "\n[LOCKED] Inactivity timeout reached. Enter passphrase to unlock:",
+            markup=False,
+        )
+        loop = asyncio.get_running_loop()
+        while True:
+            entered = await loop.run_in_executor(None, getpass.getpass, "Passphrase: ")
+            if hmac.compare_digest(
+                self._hash_passphrase(entered),
+                self._passphrase_hmac,
+            ):
+                self._last_activity = time.time()
+                self._console.print("Unlocked.", markup=False)
+                return
+            self._console.print("Incorrect passphrase. Try again.", markup=False)
 
     # ── Transport callback ─────────────────────────────────────────────────
 
@@ -240,6 +295,7 @@ class MesimCLI:
         if not parts:
             return True
 
+        self._last_activity = time.time()
         cmd = parts[0].lower()
 
         if cmd in ("quit", "exit", "q"):
@@ -386,6 +442,8 @@ class MesimCLI:
         loop = asyncio.get_running_loop()
         while self._running:
             try:
+                if self._is_locked():
+                    await self._prompt_unlock()
                 self._console.print("mesim> ", end="")
                 line = await loop.run_in_executor(None, sys.stdin.readline)
                 if not line:  # EOF
@@ -437,6 +495,7 @@ async def _run_node(
     api_port: int,
     identity_path: str,
     console: Console,
+    lock_timeout: int | None = None,
 ) -> None:
     """Fully-wired MESIM node: starts all subsystems concurrently, runs until REPL exits."""
     msgs_db, fwd_db = _db_paths(identity_path)
@@ -458,6 +517,8 @@ async def _run_node(
     cli = MesimCLI(
         identity, transport, router, store_forward, message_store,
         console=console,
+        lock_timeout=lock_timeout,
+        passphrase=passphrase,
     )
     app = create_app(identity, transport, router, store_forward, message_store)
 
@@ -648,6 +709,7 @@ def main(argv: list[str] | None = None) -> int:
                 api_port=args.api_port,
                 identity_path=args.identity,
                 console=console,
+                lock_timeout=args.lock_timeout,
             )
         )
     except KeyboardInterrupt:

@@ -9,7 +9,9 @@ ForwardQueue (sync)
 
 StoreForward (async)
     Wraps ForwardQueue and a MeshTransport.  Registers on_peer_connected so
-    that queued messages are auto-flushed when a peer reconnects.  Exposes
+    that queued messages are auto-flushed when a peer reconnects.  Also runs
+    a background loop that flushes any pending messages to peers that are
+    currently reachable (in case a connect callback was missed).  Exposes
     send_or_queue() — sends immediately if a live session exists, otherwise
     enqueues for later delivery.
 """
@@ -27,6 +29,7 @@ from core.crypto import SessionKey, decrypt_message, encrypt_message
 
 if TYPE_CHECKING:
     from mesh.transport import MeshTransport
+    from rich.console import Console
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -34,6 +37,7 @@ if TYPE_CHECKING:
 
 TTL_SECONDS        = 86_400   # 24 hours
 MAX_QUEUE_PER_PEER = 256      # cap per peer to prevent unbounded growth
+_FLUSH_INTERVAL    = 30       # seconds between periodic flush sweeps
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +82,22 @@ def _decrypt_payload(key: SessionKey, blob: bytes) -> bytes:
     return decrypt_message(nonce, ct, key)
 
 
+def normalize_peer_id(peer_id: str) -> str:
+    """Normalize peer_id to canonical UUID4 form (36-char with hyphens).
+
+    Handles the old wire format (32-char hex, no hyphens) that was produced by
+    device_id_from_bytes() before the transport canonical-form bug fix.  Any
+    peer_id that is already UUID4 form (36 chars) is returned unchanged.
+    Unknown formats are passed through without modification.
+    """
+    if len(peer_id) == 36:
+        return peer_id  # already canonical
+    if len(peer_id) == 32 and all(c in "0123456789abcdefABCDEF" for c in peer_id):
+        p = peer_id.lower()
+        return f"{p[0:8]}-{p[8:12]}-{p[12:16]}-{p[16:20]}-{p[20:32]}"
+    return peer_id  # unknown format — pass through unchanged
+
+
 # ---------------------------------------------------------------------------
 # ForwardQueue
 # ---------------------------------------------------------------------------
@@ -88,7 +108,9 @@ class ForwardQueue:
     Persistent, encrypted FIFO queue for store-and-forward messages.
 
     Each row's payload is encrypted with the provided SessionKey so the
-    SQLite file is safe at rest.
+    SQLite file is safe at rest.  All peer_id arguments are normalized to
+    canonical UUID4 form before any DB operation so entries are always
+    findable regardless of which format the caller uses.
 
     Usage::
 
@@ -130,9 +152,11 @@ class ForwardQueue:
         """
         Encrypt and add payload to the queue for peer_id.
 
+        peer_id is normalized to UUID4 form before storage.
         Returns the queue id.
         Raises OverflowError if MAX_QUEUE_PER_PEER is reached for this peer.
         """
+        peer_id = normalize_peer_id(peer_id)
         self._assert_open()
         if self.queue_size(peer_id) >= MAX_QUEUE_PER_PEER:
             raise OverflowError(
@@ -152,7 +176,10 @@ class ForwardQueue:
     def get_pending(self, peer_id: str) -> list[QueuedMessage]:
         """
         Return all non-expired queued messages for peer_id, oldest first.
+
+        peer_id is normalized to UUID4 form before the DB query.
         """
+        peer_id = normalize_peer_id(peer_id)
         self._assert_open()
         now = time.time()
         cur = self._conn.execute(
@@ -200,7 +227,8 @@ class ForwardQueue:
         return cur.rowcount
 
     def queue_size(self, peer_id: str) -> int:
-        """Count of non-expired entries for peer_id."""
+        """Count of non-expired entries for peer_id. peer_id is normalized."""
+        peer_id = normalize_peer_id(peer_id)
         self._assert_open()
         now = time.time()
         cur = self._conn.execute(
@@ -252,7 +280,9 @@ class StoreForward:
 
     Wraps a ForwardQueue and a MeshTransport.  Registers an
     on_peer_connected callback so queued messages are delivered
-    automatically when a peer comes online.
+    automatically when a peer comes online.  Also runs a background
+    flush loop every _FLUSH_INTERVAL seconds to deliver to any peers
+    that are reachable but whose connect callback was missed.
 
     Usage::
 
@@ -262,24 +292,41 @@ class StoreForward:
         await sf.stop()
     """
 
-    def __init__(self, queue: ForwardQueue, transport: MeshTransport) -> None:
+    def __init__(
+        self,
+        queue: ForwardQueue,
+        transport: MeshTransport,
+        console: Console | None = None,
+    ) -> None:
         self._queue = queue
         self._transport = transport
+        self._console = console
+        self._flush_task: asyncio.Task | None = None
 
     async def start(self) -> None:
-        """Register on_peer_connected callback with the transport."""
+        """Register on_peer_connected callback and start the periodic flush loop."""
         self._transport.on_peer_connected(self._on_peer_connected)
+        self._flush_task = asyncio.create_task(self._flush_loop())
 
     async def stop(self) -> None:
-        pass  # no background tasks to cancel
+        """Cancel the background flush loop."""
+        if self._flush_task is not None:
+            self._flush_task.cancel()
+            try:
+                await self._flush_task
+            except asyncio.CancelledError:
+                pass
+            self._flush_task = None
 
     async def send_or_queue(self, peer_id: str, payload: bytes) -> bool:
         """
         Send payload to peer_id immediately if a live session exists,
         otherwise persist it in the ForwardQueue.
 
+        peer_id is normalized to UUID4 form before the session lookup.
         Returns True if delivered immediately, False if queued.
         """
+        peer_id = normalize_peer_id(peer_id)
         sessions = self._transport.get_sessions()
         if peer_id in sessions:
             await self._transport.send(peer_id, payload)
@@ -292,10 +339,18 @@ class StoreForward:
         """
         Deliver all pending queue entries for peer_id.
 
-        Returns the number of messages sent.
-        Called automatically by _on_peer_connected; can also be called manually.
+        peer_id is normalized to UUID4 form.  Prints a console line when
+        there are messages to flush.  Returns the number of messages sent.
+        Called automatically by _on_peer_connected and _flush_loop; can
+        also be called manually.
         """
+        peer_id = normalize_peer_id(peer_id)
         pending = self._queue.get_pending(peer_id)
+        if pending and self._console is not None:
+            self._console.print(
+                f"[store-forward] flushing {len(pending)} message(s) to {peer_id}",
+                markup=False,
+            )
         sent = 0
         for msg in pending:
             try:
@@ -305,6 +360,20 @@ class StoreForward:
             except Exception:
                 self._queue.increment_attempt(msg.id)
         return sent
+
+    # ── Private helpers ────────────────────────────────────────────────────
+
+    async def _flush_loop(self) -> None:
+        """
+        Background task: every _FLUSH_INTERVAL seconds, flush pending messages
+        to any peer that currently has an active session.
+        """
+        while True:
+            await asyncio.sleep(_FLUSH_INTERVAL)
+            sessions = self._transport.get_sessions()
+            for peer_id in list(sessions):
+                if self._queue.queue_size(peer_id) > 0:
+                    await self.flush_peer(peer_id)
 
     def _on_peer_connected(self, peer_id: str) -> None:
         """Synchronous callback registered with transport; schedules flush as a task."""

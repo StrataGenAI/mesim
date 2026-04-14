@@ -28,6 +28,7 @@ from mesh.store_forward import (
     QueuedMessage,
     StoreForward,
     TTL_SECONDS,
+    normalize_peer_id,
 )
 
 
@@ -412,4 +413,220 @@ async def test_store_forward_on_peer_connected_triggers_flush(tmp_db, store_key)
     assert q.queue_size("peer1") == 0
 
     await sf.stop()
+    q.close()
+
+
+# ---------------------------------------------------------------------------
+# Group 10 — normalize_peer_id
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_peer_id_noop_for_uuid4():
+    uid = "aabbccdd-1122-3344-5566-778899aabbcc"
+    assert normalize_peer_id(uid) == uid
+
+
+def test_normalize_peer_id_converts_32char_no_hyphen():
+    raw = "aabbccdd11223344556677 8899aabbcc".replace(" ", "")  # 32 hex chars
+    raw = "aabbccdd112233445566778899aabbcc"
+    result = normalize_peer_id(raw)
+    assert result == "aabbccdd-1122-3344-5566-778899aabbcc"
+
+
+def test_normalize_peer_id_unknown_format_passthrough():
+    # Short or non-hex strings pass through unchanged
+    assert normalize_peer_id("peer1") == "peer1"
+    assert normalize_peer_id("") == ""
+
+
+def test_normalize_peer_id_uppercase_32char():
+    raw = "AABBCCDD112233445566778899AABBCC"
+    result = normalize_peer_id(raw)
+    assert result == "aabbccdd-1122-3344-5566-778899aabbcc"
+
+
+# ---------------------------------------------------------------------------
+# Group 11 — peer_id normalization in ForwardQueue
+# ---------------------------------------------------------------------------
+
+
+def test_enqueue_normalizes_32char_peer_id(tmp_db, store_key):
+    """Enqueue with old 32-char format; get_pending with UUID4 form finds it."""
+    raw32 = "aabbccdd112233445566778899aabbcc"
+    uuid4 = "aabbccdd-1122-3344-5566-778899aabbcc"
+    with ForwardQueue(tmp_db, store_key) as q:
+        q.enqueue(raw32, b"payload")
+        pending = q.get_pending(uuid4)
+    assert len(pending) == 1
+    assert pending[0].payload == b"payload"
+
+
+def test_get_pending_normalizes_32char_peer_id(tmp_db, store_key):
+    """Enqueue with UUID4 form; get_pending with 32-char form finds it."""
+    raw32 = "aabbccdd112233445566778899aabbcc"
+    uuid4 = "aabbccdd-1122-3344-5566-778899aabbcc"
+    with ForwardQueue(tmp_db, store_key) as q:
+        q.enqueue(uuid4, b"payload")
+        pending = q.get_pending(raw32)
+    assert len(pending) == 1
+
+
+def test_queue_size_normalizes_peer_id(tmp_db, store_key):
+    """queue_size with 32-char key counts entries stored under UUID4 key."""
+    raw32 = "aabbccdd112233445566778899aabbcc"
+    uuid4 = "aabbccdd-1122-3344-5566-778899aabbcc"
+    with ForwardQueue(tmp_db, store_key) as q:
+        q.enqueue(uuid4, b"x")
+        assert q.queue_size(raw32) == 1
+
+
+# ---------------------------------------------------------------------------
+# Group 12 — StoreForward: normalization, console output, periodic flush
+# ---------------------------------------------------------------------------
+
+
+async def test_send_or_queue_normalizes_peer_id(tmp_db, store_key):
+    """send_or_queue with 32-char peer_id hits session keyed by UUID4."""
+    raw32 = "aabbccdd112233445566778899aabbcc"
+    uuid4 = "aabbccdd-1122-3344-5566-778899aabbcc"
+    transport = _make_transport(sessions={uuid4: MagicMock()})
+    q = ForwardQueue(tmp_db, store_key)
+    q.open()
+
+    sf = StoreForward(q, transport)
+    await sf.start()
+
+    delivered = await sf.send_or_queue(raw32, b"normalize me")
+    assert delivered is True
+    transport.send.assert_called_once_with(uuid4, b"normalize me")
+
+    await sf.stop()
+    q.close()
+
+
+async def test_flush_peer_normalizes_32char_peer_id(tmp_db, store_key):
+    """flush_peer with old 32-char peer_id still finds and delivers messages."""
+    raw32 = "aabbccdd112233445566778899aabbcc"
+    uuid4 = "aabbccdd-1122-3344-5566-778899aabbcc"
+    transport = _make_transport(sessions={uuid4: MagicMock()})
+    q = ForwardQueue(tmp_db, store_key)
+    q.open()
+    q.enqueue(uuid4, b"stuck message")
+
+    sf = StoreForward(q, transport)
+    await sf.start()
+
+    count = await sf.flush_peer(raw32)
+    assert count == 1
+    assert q.queue_size(uuid4) == 0
+
+    await sf.stop()
+    q.close()
+
+
+async def test_flush_peer_prints_console_output(tmp_db, store_key):
+    """flush_peer prints '[store-forward] flushing N message(s) to PEER' when pending."""
+    from io import StringIO
+    from rich.console import Console
+
+    out = StringIO()
+    console = Console(file=out, highlight=False)
+
+    transport = _make_transport(sessions={"peer1": MagicMock()})
+    q = ForwardQueue(tmp_db, store_key)
+    q.open()
+    q.enqueue("peer1", b"msg1")
+    q.enqueue("peer1", b"msg2")
+
+    sf = StoreForward(q, transport, console=console)
+    await sf.start()
+    await sf.flush_peer("peer1")
+    await sf.stop()
+    q.close()
+
+    output = out.getvalue()
+    assert "[store-forward] flushing 2 message(s) to peer1" in output
+
+
+async def test_flush_peer_no_output_when_queue_empty(tmp_db, store_key):
+    """flush_peer prints nothing when there are no pending messages."""
+    from io import StringIO
+    from rich.console import Console
+
+    out = StringIO()
+    console = Console(file=out, highlight=False)
+
+    transport = _make_transport(sessions={"peer1": MagicMock()})
+    q = ForwardQueue(tmp_db, store_key)
+    q.open()
+
+    sf = StoreForward(q, transport, console=console)
+    await sf.start()
+    await sf.flush_peer("peer1")
+    await sf.stop()
+    q.close()
+
+    assert out.getvalue() == ""
+
+
+async def test_periodic_flush_loop_delivers_to_active_sessions(tmp_db, store_key, monkeypatch):
+    """_flush_loop fires every _FLUSH_INTERVAL and delivers pending messages."""
+    import mesh.store_forward as sf_mod
+    monkeypatch.setattr(sf_mod, "_FLUSH_INTERVAL", 0.05)
+
+    peer_id = "aabbccdd-1122-3344-5566-778899aabbcc"
+    transport = _make_transport(sessions={peer_id: MagicMock()})
+    q = ForwardQueue(tmp_db, store_key)
+    q.open()
+    q.enqueue(peer_id, b"loop-delivered")
+
+    sf = StoreForward(q, transport)
+    await sf.start()
+
+    await asyncio.sleep(0.2)  # let loop fire at least once
+
+    assert q.queue_size(peer_id) == 0
+
+    await sf.stop()
+    q.close()
+
+
+async def test_periodic_flush_loop_skips_peers_with_empty_queue(tmp_db, store_key, monkeypatch):
+    """_flush_loop does not call transport.send when no messages are pending."""
+    import mesh.store_forward as sf_mod
+    monkeypatch.setattr(sf_mod, "_FLUSH_INTERVAL", 0.05)
+
+    peer_id = "aabbccdd-1122-3344-5566-778899aabbcc"
+    transport = _make_transport(sessions={peer_id: MagicMock()})
+    q = ForwardQueue(tmp_db, store_key)
+    q.open()
+    # No messages enqueued
+
+    sf = StoreForward(q, transport)
+    await sf.start()
+
+    await asyncio.sleep(0.2)
+
+    transport.send.assert_not_called()
+
+    await sf.stop()
+    q.close()
+
+
+async def test_stop_cancels_flush_loop(tmp_db, store_key):
+    """stop() cancels the background flush task cleanly."""
+    transport = _make_transport(sessions={})
+    q = ForwardQueue(tmp_db, store_key)
+    q.open()
+
+    sf = StoreForward(q, transport)
+    await sf.start()
+
+    assert sf._flush_task is not None
+    assert not sf._flush_task.done()
+
+    await sf.stop()
+
+    assert sf._flush_task is None
+
     q.close()
